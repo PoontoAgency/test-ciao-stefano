@@ -1,0 +1,152 @@
+name: isolated-windows-lab
+
+on:
+  push:
+    branches:
+      - security-lab/psh03-jea-20260904
+
+permissions:
+  contents: read
+
+jobs:
+  windows-lab:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Prepare disposable PowerShell 7 remoting
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($PSVersionTable.PSEdition -ne 'Core' -or $PSVersionTable.PSVersion.Major -lt 7) {
+            throw 'POWERSHELL_7_REQUIRED'
+          }
+          Enable-PSRemoting -Force -SkipNetworkProfileCheck
+          (Get-Service -Name WinRM).WaitForStatus('Running', [TimeSpan]::FromSeconds(30))
+
+      - name: Execute private payload and encrypt evidence
+        id: lab
+        shell: pwsh
+        env:
+          LAB_PAYLOAD_B64: ${{ secrets.PSH03_LAB_PAYLOAD_B64 }}
+          LAB_RESULT_KEY_B64: ${{ secrets.PSH03_LAB_RESULT_KEY_B64 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $passed = $false
+          $privateBundle = $null
+
+          try {
+            if ([string]::IsNullOrWhiteSpace($env:LAB_PAYLOAD_B64) -or
+                [string]::IsNullOrWhiteSpace($env:LAB_RESULT_KEY_B64)) {
+              throw 'LAB_SECRET_MISSING'
+            }
+
+            $scriptPath = Join-Path $env:RUNNER_TEMP 'private-lab.ps1'
+            $resultPath = Join-Path $env:RUNNER_TEMP 'private-result.json'
+            $compressedPayload = [Convert]::FromBase64String($env:LAB_PAYLOAD_B64)
+            $sourceStream = [IO.MemoryStream]::new($compressedPayload, $false)
+            $gzipStream = [IO.Compression.GZipStream]::new(
+              $sourceStream,
+              [IO.Compression.CompressionMode]::Decompress
+            )
+            $scriptStream = [IO.File]::Open(
+              $scriptPath,
+              [IO.FileMode]::Create,
+              [IO.FileAccess]::Write,
+              [IO.FileShare]::None
+            )
+            try {
+              $gzipStream.CopyTo($scriptStream)
+            }
+            finally {
+              $scriptStream.Dispose()
+              $gzipStream.Dispose()
+              $sourceStream.Dispose()
+            }
+
+            $captured = @()
+            try {
+              $captured = @(& $scriptPath -ResultPath $resultPath *>&1)
+              $scriptExit = $LASTEXITCODE
+            }
+            catch {
+              $captured += $_ | Out-String
+              $scriptExit = 1
+            }
+
+            $resultText = if (Test-Path -LiteralPath $resultPath) {
+              Get-Content -LiteralPath $resultPath -Raw
+            }
+            else {
+              $null
+            }
+
+            $privateBundle = [ordered]@{
+              scriptExit = $scriptExit
+              result = $resultText
+              captured = @($captured | ForEach-Object { $_ | Out-String })
+            } | ConvertTo-Json -Depth 12
+
+            if ($scriptExit -eq 0 -and -not [string]::IsNullOrWhiteSpace($resultText)) {
+              $parsed = $resultText | ConvertFrom-Json
+              $passed = $parsed.conclusion -eq 'CONFIRMED_WINDOWS_JEA_PARAMETER_BYPASS'
+            }
+          }
+          catch {
+            $privateBundle = [ordered]@{
+              wrapperError = $_.Exception.Message
+            } | ConvertTo-Json -Depth 5
+          }
+
+          if ($null -eq $privateBundle) {
+            $privateBundle = '{"wrapperError":"EMPTY_PRIVATE_BUNDLE"}'
+          }
+
+          $key = [Convert]::FromBase64String($env:LAB_RESULT_KEY_B64)
+          if ($key.Length -ne 32) {
+            throw 'LAB_RESULT_KEY_INVALID'
+          }
+
+          $aes = [Security.Cryptography.Aes]::Create()
+          try {
+            $aes.KeySize = 256
+            $aes.Mode = [Security.Cryptography.CipherMode]::CBC
+            $aes.Padding = [Security.Cryptography.PaddingMode]::PKCS7
+            $aes.Key = $key
+            $aes.GenerateIV()
+            $plain = [Text.Encoding]::UTF8.GetBytes($privateBundle)
+            $encryptor = $aes.CreateEncryptor()
+            $cipher = $encryptor.TransformFinalBlock($plain, 0, $plain.Length)
+            $evidence = [byte[]]::new($aes.IV.Length + $cipher.Length)
+            [Array]::Copy($aes.IV, 0, $evidence, 0, $aes.IV.Length)
+            [Array]::Copy($cipher, 0, $evidence, $aes.IV.Length, $cipher.Length)
+            [IO.File]::WriteAllBytes(
+              (Join-Path $env:RUNNER_TEMP 'private-evidence.bin'),
+              $evidence
+            )
+          }
+          finally {
+            $aes.Dispose()
+          }
+
+          "passed=$($passed.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          if ($passed) {
+            Write-Host 'LAB_RESULT=PASS'
+          }
+          else {
+            Write-Host 'LAB_RESULT=FAIL'
+          }
+
+      - name: Upload encrypted evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: private-evidence
+          path: ${{ runner.temp }}/private-evidence.bin
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Enforce lab result
+        if: steps.lab.outputs.passed != 'true'
+        shell: pwsh
+        run: exit 1
+
